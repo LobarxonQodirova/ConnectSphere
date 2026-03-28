@@ -1,0 +1,153 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16-alpine
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-connectsphere}
+      POSTGRES_USER: ${POSTGRES_USER:-connectsphere}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-connectsphere_secret}
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-connectsphere}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - connectsphere
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --requirepass ${REDIS_PASSWORD:-redis_secret}
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-redis_secret}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - connectsphere
+
+  elasticsearch:
+    image: elasticsearch:8.12.0
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - connectsphere
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: >
+      bash -c "
+        python manage.py migrate --noinput &&
+        python manage.py collectstatic --noinput &&
+        daphne -b 0.0.0.0 -p 8000 config.asgi:application
+      "
+    volumes:
+      - ./backend:/app
+      - static_volume:/app/staticfiles
+      - media_volume:/app/media
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - connectsphere
+
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: celery -A config worker -l info -c 4 --max-tasks-per-child=1000
+    volumes:
+      - ./backend:/app
+      - media_volume:/app/media
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - connectsphere
+
+  celery_beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: celery -A config beat -l info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    volumes:
+      - ./backend:/app
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - connectsphere
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    volumes:
+      - frontend_build:/app/build
+    depends_on:
+      - backend
+    networks:
+      - connectsphere
+
+  nginx:
+    image: nginx:1.25-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - static_volume:/usr/share/nginx/static
+      - media_volume:/usr/share/nginx/media
+      - frontend_build:/usr/share/nginx/html
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - connectsphere
+
+volumes:
+  postgres_data:
+  redis_data:
+  elasticsearch_data:
+  static_volume:
+  media_volume:
+  frontend_build:
+
+networks:
+  connectsphere:
+    driver: bridge
